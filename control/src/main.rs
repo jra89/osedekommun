@@ -28,7 +28,70 @@ fn root_dir() -> PathBuf {
 }
 
 fn whoami() -> String {
-    env::var("USER").or_else(|_| env::var("LOGNAME")).unwrap_or_else(|_| "root".to_string())
+    env::var("USER")
+        .or_else(|_| env::var("LOGNAME"))
+        .unwrap_or_else(|_| "root".to_string())
+}
+
+/// (user, group) to run the web tier (nginx/php-fpm) as. php-fpm refuses to
+/// run as root, so when the control process is root (e.g. via the systemd
+/// service) the web tier runs as "nobody" instead.
+fn web_user() -> (String, String) {
+    let user = whoami();
+    if user != "root" {
+        let group = env::var("GROUP").unwrap_or_else(|_| user.clone());
+        return (user, group);
+    }
+    let group = Command::new("id")
+        .arg("-gn")
+        .arg("nobody")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    (
+        "nobody".to_string(),
+        if group.is_empty() {
+            "nogroup".to_string()
+        } else {
+            group
+        },
+    )
+}
+
+/// Make the directories the web tier writes to writable by web_user(),
+/// which only matters when that is not the current user (i.e. we are root).
+fn chown_web_dirs(root: &Path) {
+    let (user, group) = web_user();
+    if user == whoami() {
+        return;
+    }
+    for d in [
+        "data/run",
+        "data/logs",
+        "data/sessions",
+        "data/tmp",
+        "web/uploads",
+        "web/logs",
+    ] {
+        if let Ok(o) = Command::new("chown")
+            .arg("-R")
+            .arg(format!("{user}:{group}"))
+            .arg(root.join(d))
+            .output()
+        {
+            if !o.status.success() {
+                eprintln!(
+                    "warning: chown {} for {} failed: {}",
+                    d,
+                    user,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+            }
+        }
+    }
 }
 
 struct Opts {
@@ -353,8 +416,7 @@ FLUSH PRIVILEGES;";
 }
 
 fn write_conf(root: &Path, opts: &Opts) {
-    let user = whoami();
-    let group = env::var("GROUP").unwrap_or(user.clone());
+    let (user, group) = web_user();
     let root_s = root.to_string_lossy().to_string();
     let nginx = root.join("runtime/nginx").to_string_lossy().to_string();
     let port = opts.port.to_string();
@@ -507,6 +569,7 @@ fn run(root: &Path, opts: &Opts) {
         setup_db(root);
     }
     write_conf(root, opts);
+    chown_web_dirs(root);
     println!("starting php-fpm...");
     start_fpm(root);
     if !wait_sock(root) {
