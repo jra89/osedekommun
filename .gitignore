@@ -1,0 +1,33 @@
+# Local build specifications (not for distribution)
+tasks/
+
+# Runtime state (created on first ./osede run)
+data/
+web/logs/
+
+# User uploads (runtime) — keep the seeded news images
+web/uploads/*
+!web/uploads/news_09bd061ffd149b7d98eb8f2453d7f101.svg
+!web/uploads/news_7b4573e85ae6b7fc81a895e9c0b038a4.svg
+!web/uploads/news_8c91640877e8a476831ffe8acbc41d0a.svg
+!web/uploads/news_92acf3d415454d524a82b3afd937435b.svg
+!web/uploads/news_c753e67ce6f48ce25ba1646ec98f84b8.svg
+!web/uploads/news_cf5bb0f58930eca45edfff8e00a7b37d.svg
+!web/uploads/news_df4e7f8b35b122187c96fa1675057abc.svg
+!web/uploads/news_ed1b60b07a696da4fd735db1f08a2b27.svg
+
+# Build artifacts (Rust)
+control/target/
+
+# Vendored runtime binaries — downloaded on first run (see `./osede fetch`)
+runtime/
+
+# Packaged runtime tarballs for GitHub releases
+dist/
+
+# Local tooling
+.serena/
+
+# OS / editor junk
+.DS_Store
+*.swp
