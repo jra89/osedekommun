@@ -1,5 +1,9 @@
 # Osede Kommun - IT-security training environment
 
+<p align="center">
+  <img src="web/images/hero.svg" alt="Osede Kommun" width="720">
+</p>
+
 A **deliberately vulnerable** PHP/MySQL web application for hands-on IT-security
 training. Not a real municipality website. Everything runs locally on
 `127.0.0.1`.
