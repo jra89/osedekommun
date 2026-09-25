@@ -571,7 +571,7 @@ fn install_service(root: &Path, opts: &Opts) {
 fn main() {
     let args: Vec<String> = env::args().collect();
     let root = root_dir();
-    let opts = parse_opts(&args[2..]);
+    let opts = parse_opts(args.get(2..).unwrap_or(&[]));
     match args.get(1).map(|s| s.as_str()).unwrap_or("") {
         "run" => run(&root, &opts),
         "stop" => {
