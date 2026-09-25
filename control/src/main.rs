@@ -118,29 +118,83 @@ fn read_pid(root: &Path, name: &str) -> Option<i32> {
         .filter(|p| *p > 0 && pid_alive(*p))
 }
 
-fn kill_pid(pid: i32) {
-    Command::new("kill").arg("-TERM").arg(pid.to_string()).output().ok();
+fn kill_pid(pid: i32) -> bool {
+    if let Ok(o) = Command::new("kill").arg("-TERM").arg(pid.to_string()).output() {
+        if !o.status.success() {
+            eprintln!(
+                "warning: cannot send TERM to pid {} ({}); is it running as another user?",
+                pid,
+                String::from_utf8_lossy(&o.stderr).trim()
+            );
+        }
+    }
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(8) && pid_alive(pid) {
         thread::sleep(Duration::from_millis(200));
     }
     if pid_alive(pid) {
-        Command::new("kill").arg("-9").arg(pid.to_string()).output().ok();
+        if let Ok(o) = Command::new("kill").arg("-9").arg(pid.to_string()).output() {
+            if !o.status.success() {
+                eprintln!(
+                    "warning: cannot send KILL to pid {} ({}); is it running as another user?",
+                    pid,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+            }
+        }
+        thread::sleep(Duration::from_millis(300));
     }
+    !pid_alive(pid)
 }
 
-fn stop_one(root: &Path, name: &str) {
-    if let Some(pid) = read_pid(root, name) {
-        kill_pid(pid);
+/// Pids of processes whose cmdline contains `needle` (e.g. this project's
+/// mysqld binary path). Used to find processes that are running without a
+/// usable pid file.
+fn find_pids(needle: &str) -> Vec<i32> {
+    let mut out = Vec::new();
+    if let Ok(entries) = fs::read_dir("/proc") {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let pid: i32 = match name.parse() {
+                Ok(p) if p > 0 => p,
+                _ => continue,
+            };
+            if let Ok(cmd) = fs::read_to_string(format!("/proc/{}/cmdline", pid)) {
+                if cmd.split('\0').any(|a| !a.is_empty() && a.contains(needle)) {
+                    out.push(pid);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn stop_one(root: &Path, name: &str, needle: &str) {
+    let mut pids = match read_pid(root, name) {
+        Some(p) => vec![p],
+        None => find_pids(needle),
+    };
+    if pids.is_empty() && !root.join("data/run").join(name).exists() {
+        return;
+    }
+    for pid in pids.drain(..) {
+        if !kill_pid(pid) {
+            eprintln!(
+                "warning: {} (pid {}) is still running after stop; \
+                 it may be owned by another user (try sudo ./osede stop)",
+                name, pid
+            );
+        }
     }
     fs::remove_file(root.join("data/run").join(name)).ok();
 }
 
 fn stop_all(root: &Path) {
-    stop_one(root, "nginx.pid");
-    stop_one(root, "php-fpm.pid");
-    stop_one(root, "adminvisit.pid");
-    stop_one(root, "mysqld.pid");
+    let root_s = root.to_string_lossy().to_string();
+    stop_one(root, "nginx.pid", &format!("{root_s}/runtime/nginx/sbin/nginx"));
+    stop_one(root, "php-fpm.pid", &format!("{root_s}/runtime/php/sbin/php-fpm"));
+    stop_one(root, "adminvisit.pid", &format!("{root_s}/tools/adminvisit.js"));
+    stop_one(root, "mysqld.pid", &format!("{root_s}/runtime/mysql/root/bin/mysqld"));
 }
 
 fn init_mysql(root: &Path) {
@@ -196,6 +250,19 @@ fn start_mysql(root: &Path) {
 
 fn libpath(root: &Path) -> String {
     root.join("runtime/mysql/extra-libs").to_string_lossy().to_string()
+}
+
+fn port_in_use(port: u16) -> bool {
+    std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok()
+}
+
+fn print_log_tail(root: &Path, name: &str, n: usize) {
+    if let Ok(s) = fs::read_to_string(root.join("data/logs").join(name)) {
+        eprintln!("last lines of data/logs/{}:", name);
+        for line in s.lines().rev().take(n) {
+            eprintln!("  {line}");
+        }
+    }
 }
 
 fn wait_mysql(root: &Path) -> bool {
@@ -340,6 +407,10 @@ fn start_nginx(root: &Path) {
     Command::new(&bin)
         .arg("-c")
         .arg(root.join("data/conf/nginx.conf"))
+        .env(
+            "LD_LIBRARY_PATH",
+            root.join("runtime/nginx/extra-libs").to_string_lossy().to_string(),
+        )
         .stdin(Stdio::null())
         .stdout(logf.try_clone().expect("clone"))
         .stderr(logf)
@@ -398,18 +469,37 @@ fn run(root: &Path, opts: &Opts) {
     }
     ensure_dirs(root);
     fetch::ensure_runtimes(root);
+    if port_in_use(3307) {
+        let pids = find_pids("runtime/mysql/root/bin/mysqld");
+        eprintln!(
+            "error: port 3307 is already in use ({}); \
+             a mysqld is already running - try ./osede stop first, \
+             or kill the process manually",
+            if pids.is_empty() {
+                "unknown process".to_string()
+            } else {
+                format!(
+                    "pids {}",
+                    pids.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
+                )
+            }
+        );
+        std::process::exit(1);
+    }
     let datadir = root.join("data/mysql");
     let fresh = !datadir.exists()
         || fs::read_dir(&datadir)
             .map(|r| r.count() == 0)
             .unwrap_or(true);
     if fresh {
-        println!("initializing mysql datadir...");
+        println!("initializing mysql datadir (can take a minute on a slow VM)...");
         init_mysql(root);
     }
+    println!("starting mysql...");
     start_mysql(root);
     if !wait_mysql(root) {
-        eprintln!("mysql failed to start, see data/logs/mysql-error.log");
+        eprintln!("mysql failed to start:");
+        print_log_tail(root, "mysql-error.log", 15);
         std::process::exit(1);
     }
     if fresh {
@@ -417,14 +507,18 @@ fn run(root: &Path, opts: &Opts) {
         setup_db(root);
     }
     write_conf(root, opts);
+    println!("starting php-fpm...");
     start_fpm(root);
     if !wait_sock(root) {
-        eprintln!("php-fpm failed to start, see data/logs/php-fpm.log");
+        eprintln!("php-fpm failed to start:");
+        print_log_tail(root, "php-fpm.log", 15);
         std::process::exit(1);
     }
+    println!("starting nginx...");
     start_nginx(root);
     if !wait_http(opts.port) {
-        eprintln!("web failed to start, see data/logs/nginx-error.log");
+        eprintln!("web failed to start:");
+        print_log_tail(root, "nginx-error.log", 15);
         std::process::exit(1);
     }
     if opts.adminvisit {

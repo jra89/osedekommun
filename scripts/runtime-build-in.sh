@@ -39,14 +39,15 @@ make install
 rm -rf /work/runtime/nginx /work/runtime/php
 cp -a /opt/nginx /work/runtime/nginx
 cp -a /opt/php /work/runtime/php
-# bundle nginx shared-library deps, as before
+# bundle nginx shared-library deps (PCRE1 + OpenSSL 1.1 + zlib on Ubuntu 20.04)
 mkdir -p /work/runtime/nginx/extra-libs
-cp -a /usr/lib/x86_64-linux-gnu/libpcre2-8.so.0* /work/runtime/nginx/extra-libs/
-cp -a /usr/lib/x86_64-linux-gnu/libz.so.1* /work/runtime/nginx/extra-libs/
+for lib in libpcre.so.3* libssl.so.1.1* libcrypto.so.1.1* libz.so.1*; do
+  cp -a /usr/lib/x86_64-linux-gnu/$lib /work/runtime/nginx/extra-libs/
+done
 
 # --- verify everything links against this container's glibc ---
-echo "=== ldd check (no 'not found' allowed) ==="
-if ldd /work/runtime/nginx/sbin/nginx | grep -qi 'not found'; then exit 1; fi
+echo "=== ldd check (no 'not found' allowed, with extra-libs on the path) ==="
+if LD_LIBRARY_PATH=/work/runtime/nginx/extra-libs ldd /work/runtime/nginx/sbin/nginx | grep -qi 'not found'; then exit 1; fi
 if ldd /work/runtime/php/sbin/php-fpm | grep -qi 'not found'; then exit 1; fi
 /work/runtime/nginx/sbin/nginx -v 2>&1
 /work/runtime/php/sbin/php-fpm -v 2>&1 | head -1
