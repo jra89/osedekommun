@@ -1,5 +1,6 @@
 # Local build specifications (not for distribution)
 tasks/
+project.md
 
 # Runtime state (created on first ./osede run)
 data/
