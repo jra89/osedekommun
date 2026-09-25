@@ -37,6 +37,65 @@ pub const COMPONENTS: &[Component] = &[
     },
 ];
 
+/// (major, minor) of the glibc this process runs on, e.g. (2, 39).
+fn local_glibc() -> Option<(u32, u32)> {
+    unsafe {
+        let ptr = libc::gnu_get_libc_version();
+        if ptr.is_null() {
+            return None;
+        }
+        let s = std::ffi::CStr::from_ptr(ptr).to_str().ok()?;
+        let mut it = s.split('.');
+        let major: u32 = it.next()?.parse().ok()?;
+        let minor: u32 = it.next()?.parse().ok()?;
+        Some((major, minor))
+    }
+}
+
+/// Parse a tag like "231" into 231 (2.31 * 100) for comparison.
+fn glibc_tag_value(tag: &str) -> Option<u64> {
+    if tag.len() < 3 || !tag.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let major: u64 = tag[..tag.len() - 2].parse().ok()?;
+    let minor: u64 = tag[tag.len() - 2..].parse().ok()?;
+    Some(major * 100 + minor)
+}
+
+/// Pick the release asset for a component: the newest
+/// `runtime-<comp>-glibc<Mmm>.tar.gz` whose glibc requirement is <= the local
+/// one, else the untagged `runtime-<comp>.tar.gz` (official builds that run
+/// on any glibc).
+fn pick_asset(sums: &[(String, String)], comp: &str, local: Option<(u32, u32)>) -> Option<String> {
+    let prefix = format!("runtime-{}-glibc", comp);
+    let local_val = local.map(|(m, n)| (m as u64) * 100 + n as u64);
+    let mut best: Option<(u64, String)> = None;
+    for (name, _) in sums {
+        let tag = match name.strip_prefix(&prefix).and_then(|t| t.strip_suffix(".tar.gz")) {
+            Some(t) => t,
+            None => continue,
+        };
+        let value = match glibc_tag_value(tag) {
+            Some(v) => v,
+            None => continue,
+        };
+        if Some(value) > local_val {
+            continue;
+        }
+        if best.as_ref().map(|(v, _)| value > *v).unwrap_or(true) {
+            best = Some((value, name.clone()));
+        }
+    }
+    if let Some((_, name)) = best {
+        return Some(name);
+    }
+    let plain = format!("runtime-{}.tar.gz", comp);
+    if sums.iter().any(|(n, _)| n == &plain) {
+        return Some(plain);
+    }
+    None
+}
+
 fn base_url() -> String {
     std::env::var("OSEDE_RUNTIME_BASE")
         .ok()
@@ -204,8 +263,27 @@ pub fn ensure_runtimes(root: &Path) {
             std::process::exit(1);
         }
     };
+    let local = local_glibc();
+    if let Some((major, minor)) = local {
+        println!("local glibc: {}.{}", major, minor);
+    } else {
+        eprintln!("warning: could not detect local glibc, falling back to untagged runtime assets");
+    }
     for c in &missing {
-        let file = format!("runtime-{}.tar.gz", c.name);
+        let file = match pick_asset(&sums, c.name, local) {
+            Some(f) => f,
+            None => {
+                eprintln!(
+                    "error: no suitable runtime-{} asset found in the manifest \
+                     (need a build for glibc <= {})",
+                    c.name,
+                    local
+                        .map(|(m, n)| format!("{}.{n}", m))
+                        .unwrap_or_else(|| "unknown".into())
+                );
+                std::process::exit(1);
+            }
+        };
         let dest = tmp.join(&file);
         if let Err(e) = download(&base, &file, &dest, &sums) {
             eprintln!("error: {}", e);
@@ -218,5 +296,72 @@ pub fn ensure_runtimes(root: &Path) {
         ensure_exec(&root.join(c.marker));
         println!("{} ready", c.name);
         fs::remove_file(&dest).ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sums(names: &[&str]) -> Vec<(String, String)> {
+        names.iter().map(|n| (n.to_string(), "x".to_string())).collect()
+    }
+
+    #[test]
+    fn picks_newest_variant_that_fits() {
+        let s = sums(&[
+            "runtime-php.tar.gz",
+            "runtime-php-glibc231.tar.gz",
+            "runtime-php-glibc239.tar.gz",
+        ]);
+        assert_eq!(
+            pick_asset(&s, "php", Some((2, 39))),
+            Some("runtime-php-glibc239.tar.gz".into())
+        );
+        assert_eq!(
+            pick_asset(&s, "php", Some((2, 31))),
+            Some("runtime-php-glibc231.tar.gz".into())
+        );
+    }
+
+    #[test]
+    fn falls_back_to_untagged() {
+        let s = sums(&["runtime-mysql.tar.gz", "runtime-mysql-glibc239.tar.gz"]);
+        assert_eq!(
+            pick_asset(&s, "mysql", Some((2, 31))),
+            Some("runtime-mysql.tar.gz".into())
+        );
+        let s = sums(&["runtime-mysql.tar.gz"]);
+        assert_eq!(
+            pick_asset(&s, "mysql", Some((9, 99))),
+            Some("runtime-mysql.tar.gz".into())
+        );
+    }
+
+    #[test]
+    fn no_suitable_variant() {
+        let s = sums(&["runtime-nginx-glibc239.tar.gz"]);
+        assert_eq!(pick_asset(&s, "nginx", Some((2, 31))), None);
+        assert_eq!(pick_asset(&s, "nginx", None), None);
+    }
+
+    #[test]
+    fn ignores_malformed_tags() {
+        let s = sums(&[
+            "runtime-php-glibcx.tar.gz",
+            "runtime-php-glibc2.tar.gz",
+            "runtime-php-glibc2311.tar.gz",
+            "runtime-php-glibc231.tar.gz",
+        ]);
+        assert_eq!(
+            pick_asset(&s, "php", Some((2, 31))),
+            Some("runtime-php-glibc231.tar.gz".into())
+        );
+    }
+
+    #[test]
+    fn component_prefix_does_not_cross_match() {
+        let s = sums(&["runtime-php-glibc231.tar.gz"]);
+        assert_eq!(pick_asset(&s, "nginx", Some((2, 31))), None);
     }
 }
