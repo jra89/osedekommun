@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="web/images/hero.svg" alt="Osede Kommun" width="720">
+</p>
+
 # Osede Kommun — IT-security training environment
 
 A **deliberately vulnerable** PHP/MySQL web application for hands-on IT-security
