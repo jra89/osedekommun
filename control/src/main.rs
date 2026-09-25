@@ -31,6 +31,66 @@ fn whoami() -> String {
     env::var("USER").or_else(|_| env::var("LOGNAME")).unwrap_or_else(|_| "root".to_string())
 }
 
+struct Opts {
+    port: u16,
+    ip: String,
+    adminvisit: bool,
+    install_service: bool,
+}
+
+fn parse_opts(args: &[String]) -> Opts {
+    let mut port: u16 = 8080;
+    let mut ip = "127.0.0.1".to_string();
+    let mut adminvisit = false;
+    let mut install_service = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--adminvisit" {
+            adminvisit = true;
+        } else if a == "--install-service" {
+            install_service = true;
+        } else if a == "--port" || a.starts_with("--port=") {
+            let v = a
+                .strip_prefix("--port=")
+                .map(|s| s.to_string())
+                .or_else(|| args.get(i + 1).cloned());
+            match v.and_then(|v| v.parse().ok()) {
+                Some(p) => port = p,
+                None => {
+                    eprintln!("error: --port expects a number");
+                    std::process::exit(1);
+                }
+            }
+            if a == "--port" {
+                i += 1;
+            }
+        } else if a == "--ip" || a.starts_with("--ip=") {
+            let v = a
+                .strip_prefix("--ip=")
+                .map(|s| s.to_string())
+                .or_else(|| args.get(i + 1).cloned());
+            match v {
+                Some(v) if !v.is_empty() => ip = v,
+                _ => {
+                    eprintln!("error: --ip expects an address");
+                    std::process::exit(1);
+                }
+            }
+            if a == "--ip" {
+                i += 1;
+            }
+        }
+        i += 1;
+    }
+    Opts {
+        port,
+        ip,
+        adminvisit,
+        install_service,
+    }
+}
+
 fn ensure_dirs(root: &Path) {
     for d in [
         "data/run",
@@ -225,11 +285,12 @@ FLUSH PRIVILEGES;";
     }
 }
 
-fn write_conf(root: &Path) {
+fn write_conf(root: &Path, opts: &Opts) {
     let user = whoami();
     let group = env::var("GROUP").unwrap_or(user.clone());
     let root_s = root.to_string_lossy().to_string();
     let nginx = root.join("runtime/nginx").to_string_lossy().to_string();
+    let port = opts.port.to_string();
     for (src, dst) in [
         ("conf/php-fpm.conf", "data/conf/php-fpm.conf"),
         ("conf/nginx.conf", "data/conf/nginx.conf"),
@@ -239,7 +300,9 @@ fn write_conf(root: &Path) {
             .replace("@ROOT@", &root_s)
             .replace("@USER@", &user)
             .replace("@GROUP@", &group)
-            .replace("@NGINX@", &nginx);
+            .replace("@NGINX@", &nginx)
+            .replace("@WEBIP@", &opts.ip)
+            .replace("@WEBPORT@", &port);
         fs::write(root.join(dst), t).expect("write conf");
     }
     let fp = root.join("runtime/nginx/conf/fastcgi_params");
@@ -284,10 +347,10 @@ fn start_nginx(root: &Path) {
         .expect("spawn nginx");
 }
 
-fn wait_http() -> bool {
+fn wait_http(port: u16) -> bool {
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(30) {
-        if let Ok(mut s) = std::net::TcpStream::connect("127.0.0.1:8080") {
+        if let Ok(mut s) = std::net::TcpStream::connect(format!("127.0.0.1:{}", port)) {
             let req = "GET / HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n";
             if s.write_all(req.as_bytes()).is_ok() {
                 let mut buf = [0u8; 4096];
@@ -304,7 +367,7 @@ fn wait_http() -> bool {
     false
 }
 
-fn start_adminvisit(root: &Path) {
+fn start_adminvisit(root: &Path, port: u16) {
     let deno = root.join("runtime/deno/deno");
     let logf = fs::File::create(root.join("data/logs/adminvisit.out.log")).expect("log");
     let mut c = Command::new(&deno);
@@ -313,7 +376,7 @@ fn start_adminvisit(root: &Path) {
         "OSEDE_ADMINVISIT_LOG",
         root.join("data/logs/adminvisit.log").to_string_lossy().to_string(),
     );
-    c.env("OSEDE_BASE", "http://localhost:8080");
+    c.env("OSEDE_BASE", format!("http://localhost:{}", port));
     c.stdin(Stdio::null());
     c.stdout(logf.try_clone().expect("clone"));
     c.stderr(logf);
@@ -321,7 +384,11 @@ fn start_adminvisit(root: &Path) {
     fs::write(root.join("data/run/adminvisit.pid"), child.id().to_string()).ok();
 }
 
-fn run(root: &Path, adminvisit: bool) {
+fn run(root: &Path, opts: &Opts) {
+    if opts.install_service {
+        install_service(root, opts);
+        return;
+    }
     if read_pid(root, "mysqld.pid").is_some()
         || read_pid(root, "nginx.pid").is_some()
         || read_pid(root, "php-fpm.pid").is_some()
@@ -349,24 +416,24 @@ fn run(root: &Path, adminvisit: bool) {
         println!("creating database and users...");
         setup_db(root);
     }
-    write_conf(root);
+    write_conf(root, opts);
     start_fpm(root);
     if !wait_sock(root) {
         eprintln!("php-fpm failed to start, see data/logs/php-fpm.log");
         std::process::exit(1);
     }
     start_nginx(root);
-    if !wait_http() {
+    if !wait_http(opts.port) {
         eprintln!("web failed to start, see data/logs/nginx-error.log");
         std::process::exit(1);
     }
-    if adminvisit {
-        start_adminvisit(root);
+    if opts.adminvisit {
+        start_adminvisit(root, opts.port);
     }
-    println!("http://localhost:8080 is up");
+    println!("http://localhost:{} is up", opts.port);
 }
 
-fn status_cmd(root: &Path) {
+fn status_cmd(root: &Path, port: u16) {
     for name in ["mysqld.pid", "php-fpm.pid", "nginx.pid", "adminvisit.pid"] {
         match read_pid(root, name) {
             Some(pid) => println!("{}: running (pid {})", name, pid),
@@ -379,8 +446,12 @@ fn status_cmd(root: &Path) {
             }
         }
     }
-    let web = std::net::TcpStream::connect("127.0.0.1:8080").is_ok();
-    println!("web http 127.0.0.1:8080: {}", if web { "listening" } else { "closed" });
+    let web = std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok();
+    println!(
+        "web http 127.0.0.1:{}: {}",
+        port,
+        if web { "listening" } else { "closed" }
+    );
     let my = std::net::TcpStream::connect("127.0.0.1:3307").is_ok();
     println!("mysql 127.0.0.1:3307: {}", if my { "listening" } else { "closed" });
 }
@@ -404,23 +475,117 @@ fn reset(root: &Path) {
     println!("reset done, run ./osede run to start fresh");
 }
 
+fn systemctl_ok(args: &[&str]) -> bool {
+    match Command::new("systemctl").args(args).output() {
+        Ok(st) => st.status.success(),
+        Err(_) => false,
+    }
+}
+
+fn install_service(root: &Path, opts: &Opts) {
+    if !systemctl_ok(&["--version"]) {
+        eprintln!("error: systemctl not available, cannot install service");
+        std::process::exit(1);
+    }
+    let exe = match env::current_exe().and_then(|p| fs::canonicalize(&p)) {
+        Ok(p) => p,
+        Err(_) => {
+            eprintln!("error: cannot resolve path of the control binary");
+            std::process::exit(1);
+        }
+    };
+    let adminvisit = if opts.adminvisit { " --adminvisit" } else { "" };
+    let run_cmd = format!(
+        "\"{}\" run --port {} --ip {}{}",
+        exe.display(),
+        opts.port,
+        opts.ip,
+        adminvisit
+    );
+    let unit = format!(
+        "[Unit]\n\
+         Description=Osede Kommun - IT-security training environment\n\
+         After=network-online.target\n\
+         Wants=network-online.target\n\
+         \n\
+         [Service]\n\
+         Type=oneshot\n\
+         RemainAfterExit=yes\n\
+         TimeoutStartSec=900\n\
+         WorkingDirectory={}\n\
+         ExecStart={}\n\
+         ExecStop=\"{}\" stop\n\
+         \n\
+         [Install]\n\
+         WantedBy=multi-user.target\n",
+        root.display(),
+        run_cmd,
+        exe.display()
+    );
+    let unit_path = "/etc/systemd/system/osede.service";
+    if let Err(e) = fs::write(unit_path, unit) {
+        eprintln!("error: cannot write {} ({}), try running as root", unit_path, e);
+        std::process::exit(1);
+    }
+    println!("wrote {}", unit_path);
+    if !systemctl_ok(&["daemon-reload"]) || !systemctl_ok(&["enable", "osede"]) {
+        eprintln!("error: systemctl daemon-reload / enable osede failed (try running as root)");
+        std::process::exit(1);
+    }
+    let already = read_pid(root, "mysqld.pid").is_some()
+        || read_pid(root, "nginx.pid").is_some()
+        || read_pid(root, "php-fpm.pid").is_some();
+    if already {
+        println!(
+            "service installed and enabled; the stack is already running and will be managed by the service after reboot (stop it first with ./osede stop to use the service now)"
+        );
+        return;
+    }
+    println!("starting service (first start downloads any missing runtime binaries)...");
+    if !systemctl_ok(&["start", "osede"]) {
+        eprintln!("error: systemctl start osede failed, check: journalctl -u osede");
+        std::process::exit(1);
+    }
+    let start = Instant::now();
+    let mut state = String::new();
+    while start.elapsed() < Duration::from_secs(900) {
+        if let Ok(o) = Command::new("systemctl").arg("is-active").arg("osede").output() {
+            state = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if state == "active" || state == "failed" {
+                break;
+            }
+        }
+        thread::sleep(Duration::from_secs(2));
+    }
+    if state == "active" {
+        println!("service started, http://localhost:{} is up", opts.port);
+    } else {
+        eprintln!(
+            "service did not start (state: {}), check: journalctl -u osede",
+            state
+        );
+        std::process::exit(1);
+    }
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     let root = root_dir();
+    let opts = parse_opts(&args[2..]);
     match args.get(1).map(|s| s.as_str()).unwrap_or("") {
-        "run" => run(&root, args.iter().any(|a| a == "--adminvisit")),
+        "run" => run(&root, &opts),
         "stop" => {
             stop_all(&root);
             println!("stopped");
         }
-        "status" => status_cmd(&root),
+        "status" => status_cmd(&root, opts.port),
         "reset" => reset(&root),
         "fetch" => {
             fetch::ensure_runtimes(&root);
             println!("runtime components up to date");
         }
         _ => {
-            println!("usage: osede [run [--adminvisit] | stop | status | reset | fetch]");
+            println!("usage: osede [run [--port N] [--ip ADDR] [--adminvisit] [--install-service] | stop | status [--port N] | reset | fetch]");
         }
     }
 }

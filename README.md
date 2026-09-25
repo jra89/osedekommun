@@ -9,12 +9,19 @@ training. Not a real municipality website. Everything runs locally on
 The prebuilt control binary `./osede` is included:
 
 ```sh
-./osede run             # start MySQL, PHP-FPM, nginx
-./osede status          # show running services and ports
-./osede stop            # stop everything
-./osede reset           # stop and wipe all local state (DB, logs, uploads)
-./osede fetch           # download missing runtime binaries only
+./osede run                          # start MySQL, PHP-FPM, nginx
+./osede run --port 9000              # different web listen port (default 8080)
+./osede run --ip 0.0.0.0             # make the web site reachable from the network
+./osede run --adminvisit             # also run the admin headless-browser visit
+./osede run --install-service        # install as a systemd service (starts on boot)
+./osede status [--port N]            # show running services and ports
+./osede stop                         # stop everything
+./osede reset                        # stop and wipe all local state (DB, logs, uploads)
+./osede fetch                        # download missing runtime binaries only
 ```
+
+All `run` flags can be combined, e.g.
+`sudo ./osede run --port 9000 --ip 0.0.0.0 --adminvisit --install-service`.
 
 Open `http://localhost:8080`. The first `run` downloads any missing runtime
 binaries (with a progress bar per file), initializes the MySQL data directory,
@@ -40,6 +47,26 @@ downloads only the components that are missing, verifies each file against the
 3. Upload the new assets to the release (same filenames, or bump the release
    tag referenced in `control/src/fetch.rs`), then rebuild `./osede` if you
    changed the tag.
+
+## Lab deployment (teachers)
+
+Strip the answer key and git metadata before handing a copy to students:
+
+```sh
+./ctf.sh   # removes poc/, vulnerabilities/, .git and all .gitignore files
+```
+
+To expose the site to the lab network and have it start automatically when
+the VM boots:
+
+```sh
+sudo ./osede run --port 8080 --ip 0.0.0.0 --adminvisit --install-service
+```
+
+This writes `/etc/systemd/system/osede.service` pointing at the control
+binary's current location, remembers the `--port`/`--ip`/`--adminvisit`
+arguments, enables the service (auto-start on boot) and starts it now.
+Manage it afterwards with `systemctl stop|start|restart osede` or `./osede stop`.
 
 Ports: web `127.0.0.1:8080` (set in `conf/nginx.conf`), MySQL `127.0.0.1:3307`
 (set in `control/src/main.rs`).
@@ -81,6 +108,7 @@ Run it as shown in the quick start above: `./osede run`.
 | `poc/` | **Working exploit scripts** (includes a UDF RCE PoC) |
 | `tools/` | `adminvisit.js`.  Deno headless-browser script used by `./osede run --adminvisit` |
 | `scripts/` | `build-osede.sh` (rebuilds the control binary), `package-runtime.sh` (builds release tarballs) |
+| `ctf.sh` | strips `poc/`, `vulnerabilities/`, `.git` and `.gitignore` files for student deployment |
 
 ## Notes
 
