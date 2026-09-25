@@ -1,0 +1,18 @@
+[package]
+name = "osede"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "osede"
+path = "src/main.rs"
+
+[dependencies]
+ureq = "2"
+indicatif = "0.17"
+tar = "0.4"
+flate2 = "1"
+sha2 = "0.10"
+
+[profile.release]
+opt-level = 2
